@@ -223,14 +223,15 @@ class Dnslog(object):
         self.s = requests.session()
         req = self.s.get("http://www.dnslog.cn/getdomain.php",
                          proxies=proxies,
-                         timeout=30)
-        self.domain = req.text
+                         timeout=120)
+
+        self.domain = req.text if req.status_code == 200 else None
 
     def pull_logs(self):
         req = self.s.get("http://www.dnslog.cn/getrecords.php",
                          proxies=proxies,
-                         timeout=30)
-        return req.json()
+                         timeout=120)
+        return req.json() if req.status_code == 200 else []
 
 
 class Interactsh:
@@ -265,19 +266,34 @@ class Interactsh:
             "secret-key": self.secret,
             "correlation-id": self.correlation_id
         }
-        res = self.session.post(
-            f"https://{self.server}/register", headers=self.headers, json=data, timeout=30)
-        if 'success' not in res.text:
-            raise Exception("Can not initiate interact.sh DNS callback client")
+        msg = f"[PLUGIN] Interactsh: Can not initiate {self.server} DNS callback client"
+        try:
+            res = self.session.post(
+                f"https://{self.server}/register", headers=self.headers, json=data, timeout=30, verify=False)
+            if res.status_code == 401:
+                raise Exception("[PLUGIN] Interactsh: auth error")
+            elif 'success' not in res.text:
+                raise Exception(msg)
+        except requests.RequestException:
+            cprint(f"{msg}", "yellow")
 
     def pull_logs(self):
+        count = 3
         result = []
-        url = f"https://{self.server}/poll?id={self.correlation_id}&secret={self.secret}"
-        res = self.session.get(url, headers=self.headers, timeout=30).json()
-        aes_key, data_list = res['aes_key'], res['data']
-        for i in data_list:
-            decrypt_data = self.__decrypt_data(aes_key, i)
-            result.append(self.__parse_log(decrypt_data))
+        while count:
+            try:
+                url = f"https://{self.server}/poll?id={self.correlation_id}&secret={self.secret}"
+                res = self.session.get(url, headers=self.headers, timeout=30, verify=False).json()
+                aes_key, data_list = res['aes_key'], res['data']
+                for i in data_list:
+                    decrypt_data = self.__decrypt_data(aes_key, i)
+                    result.append(self.__parse_log(decrypt_data))
+                return result
+            except Exception:
+                cprint("in pull logs exceptions", "yellow")
+                count -= 1
+                time.sleep(1)
+                continue
         return result
 
     def __decrypt_data(self, aes_key, data):
@@ -302,19 +318,24 @@ class Interactsh:
 def parse_url(url):
     """
     Parses the URL.
+    :param url: Url, example: https://example.com/login.jsp
+    :return:
+        {
+            "scheme":  "https",
+            "site":  "example.com",
+            "file_path":  "/login.jsp",
+            "host":  "example.com"
+        }
     """
-
-    # Url: https://example.com/login.jsp
     url = url.replace('#', '%23')
     url = url.replace(' ', '%20')
 
-    if ('://' not in url):
+    if '://' not in url:
         url = str("http://") + str(url)
-    scheme = urlparse.urlparse(url).scheme
+    scheme = urlparse.urlparse(url).scheme  # 协议，比如https
 
-    # FilePath: /login.jsp
-    file_path = urlparse.urlparse(url).path
-    if (file_path == ''):
+    file_path = urlparse.urlparse(url).path  # /login.jsp
+    if file_path == '':
         file_path = '/'
 
     return({"scheme": scheme,
@@ -410,20 +431,24 @@ def main():
         else:
             raise ValueError("Invalid DNS Callback provider")
         dns_callback_host = dns_callback.domain
+    cprint('[•] dns_callback_host is: %s' % dns_callback_host, "green")
+    if dns_callback_host is None:
+        raise Exception("dns_callback_host is not  validate")
 
     cprint("[%] Checking for Log4j RCE CVE-2021-44228.", "magenta")
     for url in urls:
         cprint(f"[•] URL: {url}", "magenta")
         scan_url(url, dns_callback_host)
 
-    if args.custom_dns_callback_host:
+    if args.custom_dns_callback_host: # 去自定义的DNS服务器上查看dns日志有无回显，进而人工判断是否存在漏洞
         cprint("[•] Payloads sent to all URLs. Custom DNS Callback host is provided, please check your logs to verify the existence of the vulnerability. Exiting.", "cyan")
         return
 
     cprint("[•] Payloads sent to all URLs. Waiting for DNS OOB callbacks.", "cyan")
     cprint("[•] Waiting...", "cyan")
     time.sleep(int(args.wait_time))
-    records = dns_callback.pull_logs()
+    records = dns_callback.pull_logs()  # 获取dns查询记录
+    print("records is:%s" % records)
     if len(records) == 0:
         cprint("[•] Targets do not seem to be vulnerable.", "green")
     else:
